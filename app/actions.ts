@@ -7,20 +7,49 @@ import { deleteImage, uploadImage, validateImage } from "@/lib/cloudinary";
 import type { FormState } from "@/lib/types";
 
 export async function login(_prev: FormState, formData: FormData): Promise<FormState> {
-  const email = String(formData.get("email") ?? "").trim();
+  const email = String(formData.get("email") ?? "").trim().toLowerCase();
   const password = String(formData.get("password") ?? "");
   if (!email || !password) return { error: "أدخل البريد الإلكتروني وكلمة المرور" };
 
   const supabase = await createClient();
   const { error } = await supabase.auth.signInWithPassword({ email, password });
-  if (error) return { error: "بيانات الدخول غير صحيحة" };
+  if (error) {
+    console.error("Login failed", { code: error.code, status: error.status, message: error.message });
+    return { error: loginErrorMessage(error) };
+  }
 
-  const { data: isAdmin } = await supabase.rpc("is_admin");
+  const { data: isAdmin, error: adminError } = await supabase.rpc("is_admin");
+  if (adminError) {
+    console.error("is_admin check failed", adminError);
+    await supabase.auth.signOut();
+    return { error: "تعذّر التحقق من صلاحية المدير. تأكد من تشغيل ملف schema.sql في Supabase." };
+  }
   if (!isAdmin) {
     await supabase.auth.signOut();
-    return { error: "هذا الحساب لا يملك صلاحية المدير" };
+    return { error: "تم تسجيل الدخول، لكن هذا الحساب غير مضاف إلى جدول المدراء (admins)." };
   }
   redirect("/");
+}
+
+function loginErrorMessage(error: { code?: string; status?: number; message: string }): string {
+  switch (error.code) {
+    case "invalid_credentials":
+      return "البريد الإلكتروني أو كلمة المرور غير صحيحة";
+    case "email_not_confirmed":
+      return "البريد الإلكتروني لهذا الحساب غير مؤكَّد في Supabase";
+    case "user_banned":
+      return "هذا الحساب موقوف في Supabase";
+    case "over_request_rate_limit":
+      return "محاولات كثيرة، انتظر قليلاً ثم حاول مجدداً";
+  }
+  // Wrong/expired project key or URL comes back without an auth error code.
+  if (error.status === 401 || /api key/i.test(error.message)) {
+    return "مفتاح Supabase في إعدادات Vercel غير صحيح (NEXT_PUBLIC_SUPABASE_ANON_KEY)";
+  }
+  if (!error.status) {
+    return "تعذّر الاتصال بـ Supabase. تحقق من NEXT_PUBLIC_SUPABASE_URL في Vercel";
+  }
+  return `تعذّر تسجيل الدخول (${error.code ?? error.status ?? "unknown"})`;
 }
 
 export async function logout() {
