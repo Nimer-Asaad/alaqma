@@ -23,9 +23,10 @@ export async function proxy(request: NextRequest) {
     },
   });
 
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  // getClaims refreshes an expired session and verifies the JWT. With asymmetric
+  // signing keys it verifies locally (cached JWKS) instead of calling Supabase Auth.
+  const { data } = await supabase.auth.getClaims();
+  const user = data?.claims.sub;
 
   const isLogin = request.nextUrl.pathname.startsWith("/login");
   if (!user && !isLogin) {

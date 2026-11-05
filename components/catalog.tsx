@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useDeferredValue, useMemo, useState } from "react";
-import { formatILS, formatPercent, profit, thumb } from "@/lib/format";
+import { formatILS, formatPercent, profit, squareThumb } from "@/lib/format";
 import { normalizeArabic } from "@/lib/search";
 import type { Product } from "@/lib/types";
 
@@ -87,8 +87,8 @@ export default function Catalog({ products }: { products: Product[] }) {
         </div>
       ) : (
         <ul className="space-y-3">
-          {visible.map((p) => (
-            <ProductCard key={p.id} product={p} />
+          {visible.map((p, i) => (
+            <ProductCard key={p.id} product={p} eager={i < 4} />
           ))}
         </ul>
       )}
@@ -105,19 +105,33 @@ function Stat({ label, value }: { label: string; value: string }) {
   );
 }
 
-function ProductCard({ product: p }: { product: Product }) {
+// The card image box is 96 CSS px; 240px covers 2x-3x iPhone screens with one
+// cached Cloudinary variant per image.
+const THUMB_PX = 240;
+
+function ProductCard({ product: p, eager }: { product: Product; eager: boolean }) {
   const w = profit(p.wholesale_price, p.purchase_price);
   const r = profit(p.retail_price, p.purchase_price);
-  const src = thumb(p.image_url, 240);
+  const src = squareThumb(p.image_url, THUMB_PX);
   return (
-    <li>
+    // content-visibility lets the browser skip laying out off-screen cards in long lists.
+    <li className="[contain-intrinsic-size:auto_122px] [content-visibility:auto]">
       <Link
         href={`/products/${p.id}/edit`}
         className="flex gap-3 rounded-2xl bg-white p-3 ring-1 ring-slate-200 transition active:bg-slate-50"
       >
         <div className="h-24 w-24 shrink-0 overflow-hidden rounded-xl bg-slate-100">
           {src ? (
-            <img src={src} alt={p.name} loading="lazy" decoding="async" className="h-full w-full object-cover" />
+            <img
+              src={src}
+              alt={p.name}
+              width={96}
+              height={96}
+              loading={eager ? "eager" : "lazy"}
+              fetchPriority={eager ? "high" : "low"}
+              decoding="async"
+              className="h-full w-full object-cover"
+            />
           ) : (
             <div className="flex h-full items-center justify-center text-xs text-slate-400">بدون صورة</div>
           )}

@@ -1,24 +1,18 @@
 "use client";
 
-import { useRouter } from "next/navigation";
 import { useState, useTransition } from "react";
 import { deleteProduct } from "@/app/actions";
 
 export default function DeleteButton({ id, name }: { id: string; name: string }) {
-  const router = useRouter();
   const [pending, startTransition] = useTransition();
   const [error, setError] = useState<string | null>(null);
 
   function onDelete() {
-    if (!window.confirm(`حذف "${name}" نهائياً؟`)) return;
+    if (pending || !window.confirm(`حذف "${name}" نهائياً؟`)) return;
     startTransition(async () => {
+      // On success the action redirects to the catalog within the same response.
       const result = await deleteProduct(id);
-      if (result?.error) {
-        setError(result.error);
-        return;
-      }
-      router.push("/");
-      router.refresh();
+      if (result?.error) setError(result.error);
     });
   }
 

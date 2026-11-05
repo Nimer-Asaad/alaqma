@@ -1,10 +1,11 @@
 "use client";
 
 import Link from "next/link";
-import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState, useTransition } from "react";
-import { createProduct, updateProduct } from "@/app/actions";
+import { preconnect } from "react-dom";
+import { createProduct, discardUpload, updateProduct } from "@/app/actions";
 import { compressImage } from "@/lib/compress-image";
+import { getSignature, uploadToCloudinary, type UploadedImage } from "@/lib/direct-upload";
 import { formatILS, formatPercent, profit, thumb } from "@/lib/format";
 import type { FormState, Product } from "@/lib/types";
 
@@ -20,19 +21,33 @@ function toNumber(value: string): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
+/**
+ * A picked photo: compressed, then uploaded straight to Cloudinary in the
+ * background while the user types the name and prices. Resolves to the compressed
+ * file plus the upload result (null when the direct upload failed, in which case
+ * the file is sent through the server action instead).
+ */
+type ImageTask = {
+  abort: () => void;
+  promise: Promise<{ file: File; uploaded: UploadedImage | null } | null>;
+};
+
 export default function ProductForm({ product }: { product?: Product }) {
-  const router = useRouter();
   const formRef = useRef<HTMLFormElement>(null);
   const cameraRef = useRef<HTMLInputElement>(null);
   const galleryRef = useRef<HTMLInputElement>(null);
+  const imageTaskRef = useRef<ImageTask | null>(null);
+  const submittingRef = useRef(false);
   const [pending, startTransition] = useTransition();
   const [state, setState] = useState<FormState>(null);
   const [saved, setSaved] = useState(0);
+  const [phase, setPhase] = useState<"image" | "save" | null>(null);
 
-  const [image, setImage] = useState<File | null>(null);
   const [preview, setPreview] = useState<string | null>(thumb(product?.image_url, 800));
   const [removeImage, setRemoveImage] = useState(false);
   const [preparing, setPreparing] = useState(false);
+  const [progress, setProgress] = useState<number | null>(null);
+  const [uploadFailed, setUploadFailed] = useState(false);
 
   const [prices, setPrices] = useState<Prices>({
     purchase: product ? String(product.purchase_price) : "",
@@ -46,47 +61,111 @@ export default function ProductForm({ product }: { product?: Product }) {
     };
   }, [preview]);
 
-  async function onPick(e: React.ChangeEvent<HTMLInputElement>) {
+  // New products almost always get a photo: open the upload connection and fetch
+  // the upload signature early so the upload starts the moment the photo is ready.
+  preconnect("https://api.cloudinary.com", { crossOrigin: "anonymous" });
+  useEffect(() => {
+    if (!product) void getSignature();
+  }, [product]);
+
+  /** Cancels the current photo; deletes it from Cloudinary if it was uploaded but never saved. */
+  function dropImageTask() {
+    const task = imageTaskRef.current;
+    imageTaskRef.current = null;
+    if (!task) return;
+    task.abort();
+    task.promise.then((r) => {
+      if (r?.uploaded) void discardUpload(r.uploaded.publicId);
+    });
+  }
+
+  function onPick(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     e.target.value = "";
     if (!file) return;
-    setPreparing(true);
-    const compressed = await compressImage(file);
-    setPreparing(false);
-    setImage(compressed);
+    dropImageTask();
     setRemoveImage(false);
-    setPreview(URL.createObjectURL(compressed));
+    setUploadFailed(false);
+    setProgress(null);
+    setPreparing(true);
+
+    const controller = new AbortController();
+    const { signal } = controller;
+    async function run() {
+      const signature = getSignature();
+      const compressed = await compressImage(file!);
+      if (signal.aborted) return null;
+      setPreparing(false);
+      setPreview(URL.createObjectURL(compressed));
+      setProgress(0);
+      let uploaded: UploadedImage | null = null;
+      try {
+        const sig = await signature;
+        if (sig && !signal.aborted) uploaded = await uploadToCloudinary(compressed, sig, setProgress, signal);
+      } catch (err) {
+        if (!signal.aborted) console.error(err);
+      }
+      if (!signal.aborted) {
+        setProgress(null);
+        setUploadFailed(!uploaded);
+      }
+      return { file: compressed, uploaded };
+    }
+    imageTaskRef.current = { abort: () => controller.abort(), promise: run() };
   }
 
   function clearImage() {
-    setImage(null);
+    dropImageTask();
+    setPreparing(false);
+    setProgress(null);
+    setUploadFailed(false);
     setPreview(null);
     setRemoveImage(true);
   }
 
   function onSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
+    // A ref, not state, so a fast double tap can't slip in before the re-render.
+    if (submittingRef.current) return;
+    submittingRef.current = true;
     const formData = new FormData(e.currentTarget);
-    if (image) formData.set("image", image);
-    if (removeImage && !image) formData.set("remove_image", "1");
+    const task = imageTaskRef.current;
 
     startTransition(async () => {
-      const result = product ? await updateProduct(product.id, formData) : await createProduct(formData);
-      setState(result);
-      if (result) return;
-      if (product) {
-        router.push("/");
-        router.refresh();
-        return;
+      try {
+        if (task) {
+          // Usually already finished: the upload ran while the prices were typed.
+          setPhase("image");
+          const r = await task.promise;
+          if (r?.uploaded) {
+            formData.set("image_url", r.uploaded.url);
+            formData.set("image_public_id", r.uploaded.publicId);
+          } else if (r) {
+            formData.set("image", r.file);
+          }
+        } else if (removeImage) {
+          formData.set("remove_image", "1");
+        }
+
+        setPhase("save");
+        // On success, updateProduct redirects to the catalog within the same response.
+        const result = product ? await updateProduct(product.id, formData) : await createProduct(formData);
+        setState(result);
+        if (result || product) return;
+
+        // Stay on the page for fast back-to-back entry of supplier products.
+        if (imageTaskRef.current === task) imageTaskRef.current = null; // saved: keep the upload
+        formRef.current?.reset();
+        setPrices({ purchase: "", wholesale: "", retail: "" });
+        setPreview(null);
+        setRemoveImage(false);
+        setUploadFailed(false);
+        setSaved((n) => n + 1);
+        window.scrollTo({ top: 0, behavior: "smooth" });
+      } finally {
+        submittingRef.current = false;
+        setPhase(null);
       }
-      // Stay on the page for fast back-to-back entry of supplier products.
-      formRef.current?.reset();
-      setPrices({ purchase: "", wholesale: "", retail: "" });
-      setImage(null);
-      setPreview(null);
-      setRemoveImage(false);
-      setSaved((n) => n + 1);
-      window.scrollTo({ top: 0, behavior: "smooth" });
     });
   }
 
@@ -134,8 +213,27 @@ export default function ProductForm({ product }: { product?: Product }) {
             </button>
           )}
           {preparing && (
-            <div className="absolute inset-0 flex items-center justify-center bg-white/70 font-medium">
-              جارٍ تجهيز الصورة…
+            <div className="absolute inset-0 flex items-center justify-center gap-2 bg-white/70 font-medium">
+              <Spinner /> جارٍ تجهيز الصورة…
+            </div>
+          )}
+          {progress != null && (
+            <div className="absolute inset-x-0 bottom-0 bg-black/55 px-3 py-2 text-sm text-white">
+              <div className="mb-1 flex justify-between">
+                <span>جارٍ رفع الصورة…</span>
+                <span dir="ltr">{Math.round(progress * 100)}%</span>
+              </div>
+              <div className="h-1.5 overflow-hidden rounded-full bg-white/30">
+                <div
+                  className="h-full rounded-full bg-white transition-[width] duration-200"
+                  style={{ width: `${Math.max(4, progress * 100)}%` }}
+                />
+              </div>
+            </div>
+          )}
+          {uploadFailed && (
+            <div className="absolute inset-x-0 bottom-0 bg-amber-500/90 px-3 py-2 text-center text-sm text-white">
+              تعذّر الرفع المباشر، سيتم رفع الصورة عند الحفظ
             </div>
           )}
         </div>
@@ -212,8 +310,17 @@ export default function ProductForm({ product }: { product?: Product }) {
       {state?.error && <p className="rounded-xl bg-red-50 p-3 text-red-700">{state.error}</p>}
 
       <div className="sticky bottom-0 -mx-4 flex gap-3 border-t border-slate-200 bg-white/95 px-4 pt-3 pb-safe backdrop-blur">
-        <button type="submit" disabled={pending || preparing} className="btn-primary flex-1 text-lg">
-          {pending ? "جارٍ الحفظ…" : product ? "حفظ التعديلات" : "حفظ المنتج"}
+        <button type="submit" disabled={pending} aria-busy={pending} className="btn-primary flex-1 text-lg">
+          {pending && <Spinner />}
+          {!pending
+            ? product
+              ? "حفظ التعديلات"
+              : "حفظ المنتج"
+            : phase === "image" && (preparing || progress != null)
+              ? progress != null
+                ? `جارٍ رفع الصورة ${Math.round(progress * 100)}%`
+                : "جارٍ تجهيز الصورة…"
+              : "جارٍ الحفظ…"}
         </button>
         {!product && (
           <Link href="/" className="btn-secondary">
@@ -285,6 +392,15 @@ function ProfitBox({ label, sale, purchase }: { label: string; sale: number | nu
       <p className={`mt-1 text-lg font-bold ${tone}`}>{p ? formatILS(p.amount) : "—"}</p>
       <p className={`text-xs ${tone}`}>{p ? formatPercent(p.margin) : " "}</p>
     </div>
+  );
+}
+
+function Spinner() {
+  return (
+    <svg viewBox="0 0 24 24" className="h-5 w-5 animate-spin" fill="none" aria-hidden>
+      <circle cx="12" cy="12" r="9" stroke="currentColor" strokeOpacity="0.3" strokeWidth="3" />
+      <path d="M21 12a9 9 0 00-9-9" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
+    </svg>
   );
 }
 

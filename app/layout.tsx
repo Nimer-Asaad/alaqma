@@ -23,6 +23,10 @@ export const viewport: Viewport = {
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="ar" dir="rtl" className={cairo.variable}>
+      <head>
+        {/* Product images come from Cloudinary; open the connection early. */}
+        <link rel="preconnect" href="https://res.cloudinary.com" />
+      </head>
       <body className="min-h-dvh font-sans">{children}</body>
     </html>
   );

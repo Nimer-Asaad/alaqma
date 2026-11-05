@@ -1,5 +1,6 @@
 import { createServerClient } from "@supabase/ssr";
 import { cookies } from "next/headers";
+import { cache } from "react";
 import { env } from "@/lib/env";
 
 export async function createClient() {
@@ -20,14 +21,17 @@ export async function createClient() {
   });
 }
 
-/** Returns the signed-in admin's client, or null when not signed in / not an admin. */
-export async function getAdmin() {
+/**
+ * Returns the signed-in admin's client, or null when not signed in / not an admin.
+ *
+ * One round trip: `is_admin()` runs as the caller, so PostgREST first verifies the
+ * session JWT (signature + expiry) and `auth.uid()` comes from that verified token.
+ * An invalid or missing session therefore can never return true. The proxy has
+ * already refreshed the session cookie before this runs. Cached per request.
+ */
+export const getAdmin = cache(async () => {
   const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) return null;
-  const { data: isAdmin } = await supabase.rpc("is_admin");
-  if (!isAdmin) return null;
-  return { supabase, user };
-}
+  const { data: isAdmin, error } = await supabase.rpc("is_admin");
+  if (error || isAdmin !== true) return null;
+  return { supabase };
+});

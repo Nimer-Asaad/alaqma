@@ -29,16 +29,56 @@ export function validateImage(file: File): string | null {
   return null;
 }
 
+const folder = () => process.env.CLOUDINARY_FOLDER || "alaq-products";
+// Store a normalized copy; originals from phones can be huge.
+const INCOMING_TRANSFORMATION = "c_limit,h_1600,w_1600";
+
+/**
+ * Signature for one direct browser -> Cloudinary upload. Only the folder and size
+ * limit are signed, so the browser can't pick another folder or skip the resize.
+ * The API secret never leaves the server. Valid for about an hour (Cloudinary rule).
+ */
+export function signUpload() {
+  const cld = client();
+  const config = cld.config();
+  const params = {
+    folder: folder(),
+    timestamp: Math.round(Date.now() / 1000),
+    transformation: INCOMING_TRANSFORMATION,
+  };
+  const signature = cld.utils.api_sign_request(params, config.api_secret!);
+  return {
+    ...params,
+    signature,
+    apiKey: config.api_key!,
+    cloudName: config.cloud_name!,
+  };
+}
+
+/**
+ * Checks that a URL/public id pair sent by the browser points at an image in our
+ * own cloud and folder, so a client can't store arbitrary URLs.
+ */
+export function isOwnPublicId(publicId: string): boolean {
+  return /^[\w\-/]+$/.test(publicId) && publicId.startsWith(`${folder()}/`);
+}
+
+export function isOwnUpload(url: string, publicId: string): boolean {
+  const cloud = client().config().cloud_name ?? "";
+  if (!/^[\w-]+$/.test(cloud) || !isOwnPublicId(publicId)) return false;
+  // e.g. https://res.cloudinary.com/<cloud>/image/upload/v1730000000/alaq-products/abc123.jpg
+  return new RegExp(`^https://res\\.cloudinary\\.com/${cloud}/image/upload/(v\\d+/)?${publicId}\\.\\w+$`).test(url);
+}
+
 export async function uploadImage(file: File): Promise<{ url: string; publicId: string }> {
   const buffer = Buffer.from(await file.arrayBuffer());
   const result = await new Promise<UploadApiResponse>((resolve, reject) => {
     client()
       .uploader.upload_stream(
         {
-          folder: process.env.CLOUDINARY_FOLDER || "alaq-products",
+          folder: folder(),
           resource_type: "image",
-          // Store a normalized copy; originals from phones can be huge.
-          transformation: [{ width: 1600, height: 1600, crop: "limit" }],
+          transformation: INCOMING_TRANSFORMATION,
         },
         (error, res) => (error || !res ? reject(error ?? new Error("Upload failed")) : resolve(res)),
       )

@@ -25,3 +25,9 @@ export function thumb(url: string | null | undefined, width = 400): string | nul
   if (!url) return null;
   return url.replace("/upload/", `/upload/c_limit,w_${width},f_auto,q_auto/`);
 }
+
+/** Square, cropped Cloudinary thumbnail (matches an object-cover box), auto format/quality. */
+export function squareThumb(url: string | null | undefined, size: number): string | null {
+  if (!url) return null;
+  return url.replace("/upload/", `/upload/c_fill,w_${size},h_${size},f_auto,q_auto/`);
+}

@@ -2,8 +2,16 @@
 
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
+import { after } from "next/server";
 import { createClient, getAdmin } from "@/lib/supabase/server";
-import { deleteImage, uploadImage, validateImage } from "@/lib/cloudinary";
+import {
+  deleteImage,
+  isOwnPublicId,
+  isOwnUpload,
+  signUpload,
+  uploadImage,
+  validateImage,
+} from "@/lib/cloudinary";
 import type { FormState } from "@/lib/types";
 
 export async function login(_prev: FormState, formData: FormData): Promise<FormState> {
@@ -116,35 +124,82 @@ function getImage(formData: FormData): File | null {
   return file instanceof File && file.size > 0 ? file : null;
 }
 
-export async function createProduct(formData: FormData): Promise<FormState> {
-  const admin = await getAdmin();
-  if (!admin) return { error: "انتهت الجلسة، سجّل الدخول من جديد" };
+const SESSION_EXPIRED: FormState = { error: "انتهت الجلسة، سجّل الدخول من جديد" };
 
+/** Postgres "insufficient privilege": RLS rejected the caller (signed out or not an admin). */
+function isRlsDenied(error: { code?: string } | null) {
+  return error?.code === "42501";
+}
+
+/**
+ * Picks the product image from the form: an image the browser already uploaded
+ * straight to Cloudinary (url + public id), or, as a fallback, the file itself,
+ * uploaded from here after an explicit admin check.
+ */
+async function resolveImage(
+  formData: FormData,
+): Promise<{ image: { url: string; publicId: string } | null } | { state: FormState }> {
+  const url = String(formData.get("image_url") ?? "");
+  const publicId = String(formData.get("image_public_id") ?? "");
+  if (url || publicId) {
+    if (!isOwnUpload(url, publicId)) return { state: { error: "رابط الصورة غير صالح" } };
+    return { image: { url, publicId } };
+  }
+
+  const file = getImage(formData);
+  if (!file) return { image: null };
+  const invalid = validateImage(file);
+  if (invalid) return { state: { error: invalid } };
+  // Uploading spends Cloudinary quota, so check admin before doing it.
+  if (!(await getAdmin())) return { state: SESSION_EXPIRED };
+  try {
+    return { image: await uploadImage(file) };
+  } catch (err) {
+    console.error(err);
+    return { state: { error: "تعذّر رفع الصورة، حاول مرة أخرى" } };
+  }
+}
+
+/** Signs one direct browser upload to Cloudinary. Admin only; the API secret stays here. */
+export async function getUploadSignature() {
+  if (!(await getAdmin())) return null;
+  return signUpload();
+}
+
+/** Deletes a direct upload the user replaced or removed before saving the product. */
+export async function discardUpload(publicId: string) {
+  if (!isOwnPublicId(publicId)) return;
+  const admin = await getAdmin();
+  if (!admin) return;
+  const { count, error } = await admin.supabase
+    .from("products")
+    .select("id", { count: "exact", head: true })
+    .eq("image_public_id", publicId);
+  if (!error && count === 0) after(() => deleteImage(publicId));
+}
+
+// Product writes are authorized by RLS (only admins may insert/update/delete), so
+// they don't need a separate admin round trip first. Anything that touches
+// Cloudinary on the server checks admin explicitly, since RLS doesn't cover it.
+
+export async function createProduct(formData: FormData): Promise<FormState> {
   const { data, state } = parseProduct(formData);
   if (!data) return state!;
 
-  let image: { url: string; publicId: string } | null = null;
-  const file = getImage(formData);
-  if (file) {
-    const invalid = validateImage(file);
-    if (invalid) return { error: invalid };
-    try {
-      image = await uploadImage(file);
-    } catch (err) {
-      console.error(err);
-      return { error: "تعذّر رفع الصورة، حاول مرة أخرى" };
-    }
-  }
+  const resolved = await resolveImage(formData);
+  if ("state" in resolved) return resolved.state;
+  const { image } = resolved;
 
-  const { error } = await admin.supabase.from("products").insert({
+  const supabase = await createClient();
+  const { error } = await supabase.from("products").insert({
     ...data,
     image_url: image?.url ?? null,
     image_public_id: image?.publicId ?? null,
   });
   if (error) {
     console.error(error);
-    await deleteImage(image?.publicId);
-    return { error: "تعذّر حفظ المنتج" };
+    if (image) after(() => deleteImage(image.publicId));
+    return isRlsDenied(error) ? SESSION_EXPIRED : { error: "تعذّر حفظ المنتج" };
   }
 
   revalidatePath("/");
@@ -152,68 +207,73 @@ export async function createProduct(formData: FormData): Promise<FormState> {
 }
 
 export async function updateProduct(id: string, formData: FormData): Promise<FormState> {
-  const admin = await getAdmin();
-  if (!admin) return { error: "انتهت الجلسة، سجّل الدخول من جديد" };
-
   const { data, state } = parseProduct(formData);
   if (!data) return state!;
 
-  const { data: existing, error: readError } = await admin.supabase
-    .from("products")
-    .select("image_public_id")
-    .eq("id", id)
-    .single();
-  if (readError || !existing) return { error: "المنتج غير موجود" };
+  const resolved = await resolveImage(formData);
+  if ("state" in resolved) return resolved.state;
+  const { image } = resolved;
+  const removeImage = !image && formData.get("remove_image") === "1";
+
+  const supabase = await createClient();
+  // The old image id is only needed when the image is replaced or removed.
+  let oldPublicId: string | null = null;
+  if (image || removeImage) {
+    const { data: existing, error: readError } = await supabase
+      .from("products")
+      .select("image_public_id")
+      .eq("id", id)
+      .maybeSingle();
+    if (readError || !existing) {
+      if (image) after(() => deleteImage(image.publicId));
+      return isRlsDenied(readError) ? SESSION_EXPIRED : { error: "المنتج غير موجود" };
+    }
+    oldPublicId = existing.image_public_id;
+  }
 
   const update: Record<string, unknown> = { ...data };
-  let uploadedId: string | null = null;
-  const file = getImage(formData);
-  const removeImage = formData.get("remove_image") === "1";
-
-  if (file) {
-    const invalid = validateImage(file);
-    if (invalid) return { error: invalid };
-    try {
-      const image = await uploadImage(file);
-      uploadedId = image.publicId;
-      update.image_url = image.url;
-      update.image_public_id = image.publicId;
-    } catch (err) {
-      console.error(err);
-      return { error: "تعذّر رفع الصورة، حاول مرة أخرى" };
-    }
+  if (image) {
+    update.image_url = image.url;
+    update.image_public_id = image.publicId;
   } else if (removeImage) {
     update.image_url = null;
     update.image_public_id = null;
   }
 
-  const { error } = await admin.supabase.from("products").update(update).eq("id", id);
-  if (error) {
-    console.error(error);
-    await deleteImage(uploadedId);
-    return { error: "تعذّر حفظ التعديلات" };
+  const { data: updated, error } = await supabase.from("products").update(update).eq("id", id).select("id");
+  if (error || !updated?.length) {
+    if (error) console.error(error);
+    if (image) after(() => deleteImage(image.publicId));
+    if (isRlsDenied(error)) return SESSION_EXPIRED;
+    return { error: error ? "تعذّر حفظ التعديلات" : "المنتج غير موجود" };
   }
 
-  if (file || removeImage) await deleteImage(existing.image_public_id);
+  if (oldPublicId && oldPublicId !== image?.publicId) {
+    const stale = oldPublicId;
+    after(() => deleteImage(stale));
+  }
 
   revalidatePath("/");
   revalidatePath(`/products/${id}/edit`);
-  return null;
+  // Redirecting from the action streams the catalog back in this same response.
+  redirect("/");
 }
 
 export async function deleteProduct(id: string): Promise<FormState> {
-  const admin = await getAdmin();
-  if (!admin) return { error: "انتهت الجلسة، سجّل الدخول من جديد" };
-
-  const { data, error } = await admin.supabase
+  const supabase = await createClient();
+  const { data, error } = await supabase
     .from("products")
     .delete()
     .eq("id", id)
     .select("image_public_id")
-    .single();
-  if (error || !data) return { error: "تعذّر حذف المنتج" };
+    .maybeSingle();
+  if (error || !data) {
+    if (error) console.error(error);
+    return isRlsDenied(error) ? SESSION_EXPIRED : { error: "تعذّر حذف المنتج" };
+  }
 
-  await deleteImage(data.image_public_id);
+  const publicId = data.image_public_id;
+  after(() => deleteImage(publicId));
   revalidatePath("/");
-  return null;
+  redirect("/");
 }
